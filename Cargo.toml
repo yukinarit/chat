@@ -1,0 +1,10 @@
+[package]
+name = "chatsv"
+version = "0.1.0"
+authors = ["Yukinari Tani <yukinarit84@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+futures = "0.1"
+tokio = "0.1"
+bytes = "0.4"
