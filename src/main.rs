@@ -1,66 +1,17 @@
-//! A chat server that broadcasts a message to all connections.
-//!
-//! This example is explicitly more verbose than it has to be. This is to
-//! illustrate more concepts.
-//!
-//! A chat server for telnet clients. After a telnet client connects, the first
-//! line should contain the client's name. After that, all lines sent by a
-//! client are broadcasted to all other connected clients.
-//!
-//! Because the client is telnet, lines are delimited by "\r\n".
-//!
-//! You can test this out by running:
-//!
-//!     cargo run --example chat
-//!
-//! And then in another terminal run:
-//!
-//!     telnet localhost 6142
-//!
-//! You can run the `telnet` command in any number of additional windows.
-//!
-//! You can run the second command in multiple windows and then chat between the
-//! two, seeing the messages from the other client as they're received. For all
-//! connected clients they'll all join the same room and see everyone else's
-//! messages.
-
-extern crate tokio;
-#[macro_use]
-extern crate futures;
 extern crate bytes;
+extern crate futures;
+extern crate tokio;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::future::{self, Either};
-use futures::sync::mpsc;
+use bytes::BytesMut;
+use futures::sync::mpsc::{channel, Sender};
 use tokio::codec::{Decoder, Encoder};
-use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
-
-type Tx = mpsc::UnboundedSender<Bytes>;
-
-type Rx = mpsc::UnboundedReceiver<Bytes>;
-
-struct Shared {
-    peers: HashMap<SocketAddr, Peer>,
-}
-
-struct Peer {
-    tx: Tx,
-    rx: Rx,
-}
-
-impl Peer {
-    fn new() -> Self {
-        let (tx, rx) = futures::sync::mpsc::unbounded();
-        Self { tx: tx, rx: rx }
-    }
-}
 
 #[derive(Debug)]
 enum Error {
@@ -73,6 +24,39 @@ impl From<std::io::Error> for Error {
     }
 }
 
+struct Shared {
+    peers: HashMap<SocketAddr, Peer>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            peers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Peer {
+    tx: Sender<String>,
+}
+
+impl Peer {
+    fn new(tx: impl Sink<SinkItem = String, SinkError = Error> + Send + 'static) -> Self {
+        let (ctx, crx) = channel(0);
+
+        let f = crx
+            .map_err(|e| Error::IoError(format!("Peer stream error {:?}", e)))
+            .forward(tx)
+            .map(|_| ())
+            .map_err(|e| println!("Forwarding aborted: {:?}", e));
+        tokio::spawn(f);
+
+        Peer { tx: ctx }
+    }
+}
+
+/// Chat message codec.
 #[derive(Debug, Clone)]
 struct LineCodec {}
 
@@ -87,6 +71,7 @@ impl Decoder for LineCodec {
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        println!("Decode {:?}", buf);
         let pos = buf.windows(2).position(|bytes| bytes == b"\r\n");
 
         if let Some(pos) = pos {
@@ -109,50 +94,55 @@ impl Encoder for LineCodec {
     }
 }
 
-impl Shared {
-    fn new() -> Self {
-        Shared {
-            peers: HashMap::new(),
+/// Broadcast messages to all peers.
+fn broadcast(
+    sender: SocketAddr,
+    msg: String,
+    shared: Arc<Mutex<Shared>>,
+) -> impl Future<Item = (), Error = ()> {
+    println!("Broadcasting message: {}", msg);
+
+    for (addr, peer) in shared.lock().unwrap().peers.iter_mut() {
+        if sender != *addr {
+            tokio::spawn(
+                peer.clone()
+                    .tx
+                    .send(format!("{}\r\n", msg))
+                    .map(|_| ())
+                    .map_err(|e| println!("Broadcast error: {:?}", e)),
+            );
         }
     }
-}
 
-fn broadcast(shared: Arc<Mutex<Shared>>) -> impl Future<Item = (), Error = ()> {
     futures::future::ok(())
 }
 
+/// Process client connection.
 fn process(socket: TcpStream, shared: Arc<Mutex<Shared>>) {
     let addr = socket.peer_addr().unwrap();
-    let peer = Peer::new();
-    shared.lock().unwrap().peers.insert(addr, peer);
-
     let (tx, rx) = LineCodec::new().framed(socket).split();
+    shared.lock().unwrap().peers.insert(addr, Peer::new(tx));
 
     let task = rx
+        .map_err(|e| println!("Error: {:?}", e))
         .for_each(move |s| {
             println!("Got: {}", s);
-            broadcast(shared.clone())
-            //broadcast(shared.clone()).map_err(|e| {
-            //    println!("Error: {:?}", e);
-            //    ()
-            //})
+            broadcast(addr, s, shared.clone())
         })
-        .map_err(|e| {
-            println!("Error: {:?}", e);
-            ()
-        });
+        .map_err(|e| println!("Error: {:?}", e));
     tokio::spawn(task);
 }
 
 pub fn main() {
     let shared = Arc::new(Mutex::new(Shared::new()));
-    let addr = "127.0.0.1:6142".parse().unwrap();
+    let addr = "0.0.0.0:6142".parse().unwrap();
 
     let listener = TcpListener::bind(&addr).unwrap();
 
     let server = listener
         .incoming()
         .for_each(move |socket| {
+            println!("A new connection accepted.");
             process(socket, shared.clone());
             Ok(())
         })
