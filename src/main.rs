@@ -5,13 +5,15 @@ extern crate tokio;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
 use futures::sync::mpsc::{channel, Sender};
 use tokio::codec::{Decoder, Encoder};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
+use tokio::runtime::{Runtime, TaskExecutor};
+
+use self::Error::IoError;
 
 #[derive(Debug)]
 enum Error {
@@ -24,35 +26,99 @@ impl From<std::io::Error> for Error {
     }
 }
 
-struct Shared {
-    peers: HashMap<SocketAddr, Peer>,
-}
-
-impl Shared {
-    fn new() -> Self {
-        Shared {
-            peers: HashMap::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct Peer {
+    addr: SocketAddr,
     tx: Sender<String>,
 }
 
 impl Peer {
-    fn new(tx: impl Sink<SinkItem = String, SinkError = Error> + Send + 'static) -> Self {
+    fn new(
+        addr: SocketAddr,
+        tx: impl Sink<SinkItem = String, SinkError = Error> + Send + 'static,
+    ) -> Self {
         let (ctx, crx) = channel(0);
 
         let f = crx
-            .map_err(|e| Error::IoError(format!("Peer stream error {:?}", e)))
+            .map_err(|e| IoError(format!("Peer stream error {:?}", e)))
             .forward(tx)
             .map(|_| ())
             .map_err(|e| println!("Forwarding aborted: {:?}", e));
         tokio::spawn(f);
 
-        Peer { tx: ctx }
+        Peer {
+            addr: addr,
+            tx: ctx,
+        }
+    }
+}
+
+/// Chat command.
+#[derive(Debug)]
+enum Cmd {
+    Register(Peer),
+    Broadcast(String),
+}
+
+/// Controls chat messages.
+#[derive(Debug, Clone)]
+struct MessageController {
+    executor: TaskExecutor,
+    tx: Option<Sender<Cmd>>,
+}
+
+impl MessageController {
+    fn new(ex: TaskExecutor) -> Self {
+        Self {
+            executor: ex,
+            tx: None,
+        }
+    }
+
+    /// Run MessageController.
+    fn run(&mut self) -> impl Future<Item = (), Error = ()> {
+        let (tx, rx) = channel(0);
+        self.tx = Some(tx);
+        let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
+
+        let ex = self.executor.clone();
+
+        // TODO ここをpollでかきたい
+        rx.map_err(|e| IoError(format!("MessageController stream error {:?}", e)))
+            .for_each(move |cmd| {
+                let f = match cmd {
+                    Cmd::Register(peer) => {
+                        println!("A new peer registered: {:?}", peer);
+                        peers.insert(peer.addr, peer);
+                        Ok(())
+                    }
+                    Cmd::Broadcast(msg) => {
+                        for (addr, peer) in peers.iter() {
+                            println!("Broadcasting {} to {:?}", msg, addr);
+                            let f = peer
+                                .tx
+                                .clone()
+                                .send(format!("{}\r\n", msg.clone()))
+                                .map(|_| ())
+                                .map_err(|e| println!("Broadcast error: {:?}", e));
+                            ex.spawn(f)
+                        }
+                        Ok(())
+                    }
+                };
+                f
+            })
+            .map_err(|e| println!("Forwarding aborted: {:?}", e))
+    }
+
+    /// Push a new chat command to the queue.
+    fn push_cmd(&self, cmd: Cmd) -> impl Future<Item = (), Error = Error> {
+        self.tx
+            .clone()
+            .unwrap()
+            .send(cmd)
+            .map(|_| ())
+            .map_err(|e| IoError(e.to_string()))
     }
 }
 
@@ -94,56 +160,47 @@ impl Encoder for LineCodec {
     }
 }
 
-/// Broadcast messages to all peers.
-fn broadcast(
-    sender: SocketAddr,
-    msg: String,
-    shared: Arc<Mutex<Shared>>,
-) -> impl Future<Item = (), Error = ()> {
-    println!("Broadcasting message: {}", msg);
-
-    for (addr, peer) in shared.lock().unwrap().peers.iter_mut() {
-        if sender != *addr {
-            tokio::spawn(
-                peer.clone()
-                    .tx
-                    .send(format!("{}\r\n", msg))
-                    .map(|_| ())
-                    .map_err(|e| println!("Broadcast error: {:?}", e)),
-            );
-        }
-    }
-
-    futures::future::ok(())
-}
-
 /// Process client connection.
-fn process(socket: TcpStream, shared: Arc<Mutex<Shared>>) {
+fn process(executor: TaskExecutor, socket: TcpStream, ctrl: MessageController) {
     let addr = socket.peer_addr().unwrap();
     let (tx, rx) = LineCodec::new().framed(socket).split();
-    shared.lock().unwrap().peers.insert(addr, Peer::new(tx));
+
+    let f = ctrl
+        .push_cmd(Cmd::Register(Peer::new(addr, tx)))
+        .map_err(|e| println!("Peer register error: {:?}", e));
+
+    executor.spawn(f);
 
     let task = rx
         .map_err(|e| println!("Error: {:?}", e))
         .for_each(move |s| {
             println!("Got: {}", s);
-            broadcast(addr, s, shared.clone())
+            ctrl.push_cmd(Cmd::Broadcast(s))
+                .map_err(|e| println!("MessageController error: {:?}", e))
         })
         .map_err(|e| println!("Error: {:?}", e));
-    tokio::spawn(task);
+
+    // こっちも。
+    // RegisterのfutureとTaskのfutureをjoinさせることはできる？
+    executor.spawn(task);
 }
 
 pub fn main() {
-    let shared = Arc::new(Mutex::new(Shared::new()));
+    let mut runtime = Runtime::new().unwrap();
+    let ex = runtime.executor().clone();
     let addr = "0.0.0.0:6142".parse().unwrap();
 
     let listener = TcpListener::bind(&addr).unwrap();
+    let mut ctrl = MessageController::new(ex.clone());
+    ex.spawn(ctrl.run());
 
+    // TODO ここって確実にctrl.run()終わった後に呼ばれるの？
+    // ctrl.run()とserverをjoinさせることは可能？
     let server = listener
         .incoming()
         .for_each(move |socket| {
             println!("A new connection accepted.");
-            process(socket, shared.clone());
+            process(ex.clone(), socket, ctrl.clone());
             Ok(())
         })
         .map_err(|err| {
@@ -152,5 +209,8 @@ pub fn main() {
 
     println!("server running on localhost:6142");
 
-    tokio::run(server);
+    match runtime.block_on(server) {
+        Ok(_) => {}
+        Err(e) => println!("Runtime error: {:?}", e),
+    };
 }
