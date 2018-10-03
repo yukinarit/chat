@@ -57,7 +57,7 @@ impl Peer {
 #[derive(Debug)]
 enum Cmd {
     Register(Peer),
-    Broadcast(String),
+    Broadcast(SocketAddr, String),
 }
 
 /// Controls chat messages.
@@ -83,7 +83,6 @@ impl MessageController {
 
         let ex = self.executor.clone();
 
-        // TODO ここをpollでかきたい
         rx.map_err(|e| IoError(format!("MessageController stream error {:?}", e)))
             .for_each(move |cmd| {
                 let f = match cmd {
@@ -92,16 +91,18 @@ impl MessageController {
                         peers.insert(peer.addr, peer);
                         Ok(())
                     }
-                    Cmd::Broadcast(msg) => {
+                    Cmd::Broadcast(sender, msg) => {
                         for (addr, peer) in peers.iter() {
-                            println!("Broadcasting {} to {:?}", msg, addr);
-                            let f = peer
-                                .tx
-                                .clone()
-                                .send(format!("{}\r\n", msg.clone()))
-                                .map(|_| ())
-                                .map_err(|e| println!("Broadcast error: {:?}", e));
-                            ex.spawn(f)
+                            if sender != *addr {
+                                println!("Broadcasting '{}' to {:?}", msg, addr);
+                                let f = peer
+                                    .tx
+                                    .clone()
+                                    .send(format!("{}\r\n", msg.clone()))
+                                    .map(|_| ())
+                                    .map_err(|e| println!("Broadcast error: {:?}", e));
+                                ex.spawn(f)
+                            }
                         }
                         Ok(())
                     }
@@ -111,11 +112,24 @@ impl MessageController {
             .map_err(|e| println!("Forwarding aborted: {:?}", e))
     }
 
+    /// Get a handle.
+    fn handle(&self) -> Option<MessageHandle> {
+        match self.tx {
+            Some(ref tx) => Some(MessageHandle { tx: tx.clone() }),
+            None => None,
+        }
+    }
+}
+
+struct MessageHandle {
+    tx: Sender<Cmd>,
+}
+
+impl MessageHandle {
     /// Push a new chat command to the queue.
     fn push_cmd(&self, cmd: Cmd) -> impl Future<Item = (), Error = Error> {
         self.tx
             .clone()
-            .unwrap()
             .send(cmd)
             .map(|_| ())
             .map_err(|e| IoError(e.to_string()))
@@ -161,11 +175,11 @@ impl Encoder for LineCodec {
 }
 
 /// Process client connection.
-fn process(executor: TaskExecutor, socket: TcpStream, ctrl: MessageController) {
+fn process(executor: TaskExecutor, socket: TcpStream, handle: MessageHandle) {
     let addr = socket.peer_addr().unwrap();
     let (tx, rx) = LineCodec::new().framed(socket).split();
 
-    let f = ctrl
+    let f = handle
         .push_cmd(Cmd::Register(Peer::new(addr, tx)))
         .map_err(|e| println!("Peer register error: {:?}", e));
 
@@ -175,13 +189,12 @@ fn process(executor: TaskExecutor, socket: TcpStream, ctrl: MessageController) {
         .map_err(|e| println!("Error: {:?}", e))
         .for_each(move |s| {
             println!("Got: {}", s);
-            ctrl.push_cmd(Cmd::Broadcast(s))
+            handle
+                .push_cmd(Cmd::Broadcast(addr, s))
                 .map_err(|e| println!("MessageController error: {:?}", e))
         })
         .map_err(|e| println!("Error: {:?}", e));
 
-    // こっちも。
-    // RegisterのfutureとTaskのfutureをjoinさせることはできる？
     executor.spawn(task);
 }
 
@@ -194,13 +207,11 @@ pub fn main() {
     let mut ctrl = MessageController::new(ex.clone());
     ex.spawn(ctrl.run());
 
-    // TODO ここって確実にctrl.run()終わった後に呼ばれるの？
-    // ctrl.run()とserverをjoinさせることは可能？
     let server = listener
         .incoming()
         .for_each(move |socket| {
             println!("A new connection accepted.");
-            process(ex.clone(), socket, ctrl.clone());
+            process(ex.clone(), socket, ctrl.handle().unwrap());
             Ok(())
         })
         .map_err(|err| {
