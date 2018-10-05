@@ -2,12 +2,11 @@ extern crate bytes;
 extern crate futures;
 extern crate tokio;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::Deref;
 
 use bytes::BytesMut;
-use futures::sync::mpsc::{channel, Sender};
+use futures::sync::mpsc::{channel, Receiver, Sender};
 use tokio::codec::{Decoder, Encoder};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
@@ -26,97 +25,80 @@ impl From<std::io::Error> for Error {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Peer {
-    addr: SocketAddr,
-    tx: Sender<String>,
-}
-
-impl Peer {
-    fn new(
-        addr: SocketAddr,
-        tx: impl Sink<SinkItem = String, SinkError = Error> + Send + 'static,
-    ) -> Self {
-        let (ctx, crx) = channel(0);
-
-        let f = crx
-            .map_err(|e| IoError(format!("Peer stream error {:?}", e)))
-            .forward(tx)
-            .map(|_| ())
-            .map_err(|e| println!("Forwarding aborted: {:?}", e));
-        tokio::spawn(f);
-
-        Peer {
-            addr: addr,
-            tx: ctx,
-        }
-    }
-}
-
 /// Chat command.
-#[derive(Debug)]
 enum Cmd {
-    Register(Peer),
+    Register(
+        SocketAddr,
+        Box<Sink<SinkItem = String, SinkError = Error> + 'static + Send + Sync>,
+    ),
     Broadcast(SocketAddr, String),
 }
 
 /// Controls chat messages.
-#[derive(Debug, Clone)]
 struct MessageController {
-    executor: TaskExecutor,
-    tx: Option<Sender<Cmd>>,
+    rx: Receiver<Cmd>,
+    txs: Vec<Box<Sink<SinkItem = String, SinkError = Error> + 'static + Send + Sync>>,
 }
 
 impl MessageController {
-    fn new(ex: TaskExecutor) -> Self {
+    fn new(rx: Receiver<Cmd>) -> Self {
         Self {
-            executor: ex,
-            tx: None,
+            rx: rx,
+            txs: vec![],
         }
     }
+}
 
-    /// Run MessageController.
-    fn run(&mut self) -> impl Future<Item = (), Error = ()> {
-        let (tx, rx) = channel(0);
-        self.tx = Some(tx);
-        let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
+impl Stream for MessageController {
+    type Item = ();
+    type Error = Error;
 
-        let ex = self.executor.clone();
-
-        rx.map_err(|e| IoError(format!("MessageController stream error {:?}", e)))
-            .for_each(move |cmd| {
-                let f = match cmd {
-                    Cmd::Register(peer) => {
-                        println!("A new peer registered: {:?}", peer);
-                        peers.insert(peer.addr, peer);
-                        Ok(())
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.rx.poll() {
+            Ok(Async::Ready(Some(cmd))) => {
+                match cmd {
+                    Cmd::Register(addr, tx) => {
+                        println!("A new peer registered: {:?}", addr);
+                        self.txs.push(tx);
+                        Ok(Async::Ready(Some(())))
                     }
                     Cmd::Broadcast(sender, msg) => {
-                        for (addr, peer) in peers.iter() {
-                            if sender != *addr {
-                                println!("Broadcasting '{}' to {:?}", msg, addr);
-                                let f = peer
-                                    .tx
-                                    .clone()
-                                    .send(format!("{}\r\n", msg.clone()))
-                                    .map(|_| ())
-                                    .map_err(|e| println!("Broadcast error: {:?}", e));
-                                ex.spawn(f)
+                        for tx in self.txs.iter_mut() {
+                            match tx.start_send(format!("{}\r\n", msg.clone())) {
+                                Ok(AsyncSink::Ready) => {
+                                    // バッファーにのせれたよ
+                                }
+                                Ok(AsyncSink::NotReady(msg)) => {
+                                    // クライアントがつまっててバッファにのせれなかった
+                                    // TODO リトライしないとこの人にメッセージをおくれない
+                                }
+                                Err(_) => {
+                                    // TODO txsから削除とかする
+                                    return Ok(Async::Ready(Some(())));
+                                }
+                            }
+
+                            match tx.poll_complete() {
+                                Ok(Async::Ready(())) => {
+                                    // おくれたよ
+                                }
+                                Ok(Async::NotReady) => {
+                                    // まだフラッシュできてないよ
+                                }
+                                Err(_) => {
+                                    // TODO txsから削除とかする
+                                    return Err(Error::IoError(format!("Message stream error.")));
+                                }
                             }
                         }
-                        Ok(())
-                    }
-                };
-                f
-            })
-            .map_err(|e| println!("Forwarding aborted: {:?}", e))
-    }
 
-    /// Get a handle.
-    fn handle(&self) -> Option<MessageHandle> {
-        match self.tx {
-            Some(ref tx) => Some(MessageHandle { tx: tx.clone() }),
-            None => None,
+                        Ok(Async::Ready(Some(())))
+                    }
+                }
+            }
+            Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(e) => Err(Error::IoError(format!("Message stream error."))),
         }
     }
 }
@@ -175,12 +157,14 @@ impl Encoder for LineCodec {
 }
 
 /// Process client connection.
-fn process(executor: TaskExecutor, socket: TcpStream, handle: MessageHandle) {
+fn process(executor: TaskExecutor, socket: TcpStream, handle: Sender<Cmd>) {
     let addr = socket.peer_addr().unwrap();
     let (tx, rx) = LineCodec::new().framed(socket).split();
 
     let f = handle
-        .push_cmd(Cmd::Register(Peer::new(addr, tx)))
+        .clone()
+        .send(Cmd::Register(addr, Box::new(tx)))
+        .map(|_| ())
         .map_err(|e| println!("Peer register error: {:?}", e));
 
     executor.spawn(f);
@@ -190,7 +174,9 @@ fn process(executor: TaskExecutor, socket: TcpStream, handle: MessageHandle) {
         .for_each(move |s| {
             println!("Got: {}", s);
             handle
-                .push_cmd(Cmd::Broadcast(addr, s))
+                .clone()
+                .send(Cmd::Broadcast(addr, s))
+                .map(|_| ())
                 .map_err(|e| println!("MessageController error: {:?}", e))
         })
         .map_err(|e| println!("Error: {:?}", e));
@@ -204,14 +190,18 @@ pub fn main() {
     let addr = "0.0.0.0:6142".parse().unwrap();
 
     let listener = TcpListener::bind(&addr).unwrap();
-    let mut ctrl = MessageController::new(ex.clone());
-    ex.spawn(ctrl.run());
+    let (tx, rx) = channel(0);
+    let ctrl = MessageController::new(rx);
+    ex.spawn(
+        ctrl.for_each(|_| Ok(()))
+            .map_err(|e| println!("Message stream error: {:?}", e)),
+    );
 
     let server = listener
         .incoming()
         .for_each(move |socket| {
             println!("A new connection accepted.");
-            process(ex.clone(), socket, ctrl.handle().unwrap());
+            process(ex.clone(), socket, tx.clone());
             Ok(())
         })
         .map_err(|err| {
